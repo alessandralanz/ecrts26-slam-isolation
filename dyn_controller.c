@@ -21,43 +21,10 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
+#include "slam_common.h"
 
-#define RING_BUF_PAGES 8
-#define PAGE_SIZE 4096
-#define RING_BUF_SIZE (RING_BUF_PAGES * PAGE_SIZE)
-#define MAX_CPUS 4
-#define MAX_FDS 64
 #define RATE_WINDOW 32 // rolling window for instruction rate samples
 #define FRAME_WINDOW 50 // rolling window for frame completion times
-
-// memory barrier macros to prevent reordering or reads/writes 
-#ifdef __aarch64__
-// read memory barrier, on ARM64 it emits `dmb ishld` which stands for data memory barrier, inner shareable domain, load-load/load-store ordering
-// this means that after this instruction is executed, all loads that were issued before the barrier are guaranteed to have completed before any load issued after the barrier starts
-// used for reading data_head from the ring buffer metadata 
-// (need to be sure that we see the actual data the kernel wrote before that head pointer update and not stale data from before the kernel wrote it)
-#define rmb() __asm__ __volatile__("dmb ishld" ::: "memory")
-// full mmeory barrier emitting `dmb ish` (data memory barrier, inner shareable domain, full ordering) which orders all memory accesses (loads and stores) before the barrier relatiev to all memory accesses after it
-// used after the consumer is done reading the ring buffer before writing back data_tail to make sure the kernel sees the tail update only after we've finished reading
-#define mb()  __asm__ __volatile__("dmb ish" ::: "memory")
-#else
-// prevent compiler from optimizing and tells compiler that the instructions may read/write any memory preventing reordering memory accesses
-#define rmb() __asm__ __volatile__("" ::: "memory")
-#define mb()  __asm__ __volatile__("" ::: "memory")
-#endif
-
-enum checkpoint {
-    CP_VT = 0, CP_PREPROC, CP_KLT, CP_POSE, CP_DONE, CP_COUNT
-};
-
-static const char *cp_names[] = {
-    "visualTracking", "preprocessImage", "kltTracking", "computePose", "frameDone"
-};
-
-// byte offsets of each function within libov2slam.so (change every time we recompile)
-static unsigned long default_offsets[CP_COUNT] = {
-    0x5d000, 0x58ae0, 0x58dc0, 0x5a8d0, 0x56750
-};
 
 struct phase_calib {
     double avg_time_ms; // average frame duration
@@ -161,64 +128,6 @@ struct shared_state {
     pthread_mutex_t log_mutex; // protects it because both threads write to the same file
 };
 
-// g_running is the main loop's termination flag
-static volatile int g_running = 1;
-// handle_signal is registered for SIGINT and SIGTERM and when the signal arrives it sets g_running = 0 which causes termination on next iteration
-static void handle_signal(int sig) { 
-    (void)sig; // supress unused parametere compiler warning, doesn't matter which signal fired, the action is the same for both
-    g_running = 0; 
-}
-
-// each uprobe installed on one CPU gets one
-struct probe_fd {
-    int fd; // perf_event fd returned by perf_event_open
-    struct perf_event_mmap_page *meta; // points to the mmap metadata page (first page of the mmap region)
-    char *ring; // start of the actual data ring buffer (immediately after metadata page)
-    size_t mmap_size; // total size of the mmap region (need so we can munmap at cleanup)
-    enum checkpoint cp; // records which checkpoints this probe corresponds to 
-    int cpu; // which cpu its installed on
-};
-
-// time in ms
-static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
-}
-
-// wrapper around perf_event_open syscall 
-static long sys_perf_event_open(struct perf_event_attr *a, pid_t pid, int cpu, int grp, unsigned long flags) {
-    return syscall(SYS_perf_event_open, a, pid, cpu, grp, flags);
-}
-
-static int read_uprobe_type(void) {
-    int t; FILE *f = fopen("/sys/bus/event_source/devices/uprobe/type","r");
-    if (!f) return -1;
-    if (fscanf(f,"%d",&t)!=1) { fclose(f); return -1; }
-    fclose(f); return t;
-}
-
-static uint64_t read_total_insns(struct shared_state *st) {
-    uint64_t total = 0;
-    for (int i = 0; i < st->n_cpus; i++) {
-        if (st->insn_fds[i] >= 0) {
-            uint64_t v = 0;
-            if (read(st->insn_fds[i], &v, sizeof(v)) == (ssize_t)sizeof(v))
-                total += v;
-        }
-    }
-    return total;
-}
-
-static int parse_cpus(const char *str, int *cpus, int max) {
-    int n = 0;
-    char buf[64];
-    strncpy(buf, str, sizeof(buf)-1); buf[sizeof(buf)-1] = 0;
-    char *tok = strtok(buf, ",");
-    while (tok && n < max) { cpus[n++] = atoi(tok); tok = strtok(NULL, ","); }
-    return n;
-}
-
 // load calibration from file
 // each line (one line per phase): phase_name avg_time_ms avg_rate_insns_per_ms
 // frameDone's rate becomes the overall baseline
@@ -262,69 +171,6 @@ static int load_calibration(const char *path, struct shared_state *st) {
     return loaded;
 }
 
-// install one uprobe on one CPU
-static int setup_uprobe_on_cpu(struct probe_fd *p, int uprobe_type, const char *lib_path, unsigned long offset, enum checkpoint cp, int cpu) {
-    struct perf_event_attr attr;
-    memset(&attr, 0, sizeof(attr)); // zero initialize the attribute struct 
-    attr.size = sizeof(attr); // set size so kernel knows how large the struct is
-    attr.type = uprobe_type;
-    attr.config1 = (__u64)(unsigned long)lib_path;
-    attr.config2 = offset;
-    attr.sample_period = 1; // give event record for every single call
-    attr.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME; // sample should include the PID and TID of the process that hit the probe
-    attr.disabled = 1; // create event in a disabled state (prevents events from firing during setup)
-    attr.wakeup_events = 1; // wake up polling thread after every 1 event
-
-    // install uprobe on any process in the system (later filtered by PID when draining the ring buffer)
-    int fd = sys_perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
-    if (fd < 0) return -1;
-
-    // map the perf event's ring buffer into our address space
-    size_t mmap_size = (1 + RING_BUF_PAGES) * PAGE_SIZE;
-    void *base = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0); // need to read events and update data_tail and it's shared because the kernel needs to see our data_tail writes
-    if (base == MAP_FAILED) { close(fd); return -1; }
-
-    // fill in the probe_fd struct
-    p->fd = fd;
-    p->meta = (struct perf_event_mmap_page *)base;
-    p->ring = (char *)base + PAGE_SIZE;
-    p->mmap_size = mmap_size;
-    p->cp = cp;
-    p->cpu = cpu;
-    return 0;
-}
-
-// drain ring buffer/ reading the ring buffer
-// reads all pending events from one probe's ring buffer
-static int drain_probe(struct probe_fd *p, pid_t target_pid, uint64_t *time_out) {
-    struct perf_event_mmap_page *meta = p->meta;
-    __sync_synchronize(); // full memory barrier that makes sure that all of the kernel's writes (even event data) are visible to us before we read data_head
-    uint64_t head = meta->data_head; // read kernel's write pointer
-    rmb(); // ensures that loads are ordered: we see the data that existed when data_head was written (not some older or newer version)
-    uint64_t tail = meta->data_tail; // read our consumer pointer
-    if (head == tail) return 0; // mailbox is empty 
-
-    int matched = 0;
-    while (tail < head) {
-        uint64_t off = tail % RING_BUF_SIZE;
-        struct perf_event_header *ehdr = (struct perf_event_header *)(p->ring + off);
-        // only care about actual probe hits
-        if (ehdr->type == PERF_RECORD_SAMPLE) {
-            char *ptr = (char *)ehdr + sizeof(*ehdr);
-            uint32_t pid = *(uint32_t *)ptr; ptr += 4;
-            ptr += 4;
-            uint64_t ts = *(uint64_t *)ptr;
-            if ((pid_t)pid == target_pid) { 
-                *time_out = ts; matched++; 
-            }
-        }
-        tail += ehdr->size;
-    }
-    mb();
-    meta->data_tail = tail;
-    return matched;
-}
-
 // monitor thread: samples instruction rate every sample_interval_ms, reads instruction counters, and decides to stop/resume
 static void *monitor_thread_func(void *arg) {
     struct shared_state *st = (struct shared_state *)arg;
@@ -342,7 +188,7 @@ static void *monitor_thread_func(void *arg) {
         if (!st->running) continue;
 
         double now = now_ms();
-        uint64_t cur_insns = read_total_insns(st);
+        uint64_t cur_insns = read_total_insns(st->insn_fds, st->n_cpus);
 
         if (prev_time > 0) {
             double dt = now - prev_time;
@@ -667,7 +513,7 @@ int main(int argc, char **argv) {
 
         // snapshot current time and instruction count 
         double now = now_ms();
-        uint64_t cur_insns = read_total_insns(&state);
+        uint64_t cur_insns = read_total_insns(state.insn_fds, state.n_cpus);
 
         // iterate through all probe FDs 
         for (int i = 0; i < n_fds; i++) {
